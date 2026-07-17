@@ -13,43 +13,55 @@ def _bar(pct: float) -> str:
 def write_html(payload: dict, path: str) -> None:
     s, table = payload["summary"], payload["table"]
     rows = [asdict(r) if not isinstance(r, dict) else r for r in payload["results"]]
-    judged = s["judged"]
+    judged = s["judge_mode"] != "off"
 
     def color(p): return "#3ecf8e" if p >= 80 else "#ffb454" if p >= 50 else "#ff6b6b"
+
+    def final_ok(r: dict) -> bool:
+        # Mirror Result.final_ok for plain dicts loaded from a run.
+        if r["kind"] == "permission":
+            return r["rule_ok"] and (r["judge_ok"] if r["judged"] else True)
+        return r["rule_ok"] or (r["judged"] and r["judge_ok"])
+
+    def score_col(row, key_final="final_pct"):
+        return (f'<td style="color:{color(row[key_final])}">{row[key_final]}%</td>'
+                if judged else "")
 
     trs = []
     for row in table:
         if row["judgement"]:
             continue
-        j = f'<td style="color:{color(row["judge_pct"])}">{row["judge_pct"]}%</td>' if judged else ""
         trs.append(
             f'<tr><td>{html.escape(row["label"])}</td><td class=n>{row["n"]}</td>'
-            f'<td style="color:{color(row["rule_pct"])}">{row["rule_pct"]}%</td>{j}'
-            f'<td>{_bar(row["rule_pct"])}</td></tr>')
-    jt = f'<td style="color:{color(s["factual_judge_pct"])}">{s["factual_judge_pct"]}%</td>' if judged else ""
+            f'<td style="color:{color(row["rule_pct"])}">{row["rule_pct"]}%</td>{score_col(row)}'
+            f'<td>{_bar(row["final_pct"] if judged else row["rule_pct"])}</td></tr>')
+    jt = (f'<td style="color:{color(s["factual_final_pct"])}">{s["factual_final_pct"]}%</td>'
+          if judged else "")
     trs.append(
         f'<tr class=total><td>Factual overall</td><td class=n>{s["factual_n"]}</td>'
         f'<td style="color:{color(s["factual_rule_pct"])}">{s["factual_rule_pct"]}%</td>{jt}'
-        f'<td>{_bar(s["factual_rule_pct"])}</td></tr>')
+        f'<td>{_bar(s["factual_final_pct"] if judged else s["factual_rule_pct"])}</td></tr>')
 
     jrows = "".join(
         f'<tr><td>{html.escape(r["label"])}</td><td class=n>{r["n"]}</td>'
-        f'<td style="color:{color(r["rule_pct"])}">{r["rule_pct"]}%</td>'
-        + (f'<td style="color:{color(r["judge_pct"])}">{r["judge_pct"]}%</td>' if judged else "")
-        + f'<td>{_bar(r["rule_pct"])}</td></tr>'
+        f'<td style="color:{color(r["rule_pct"])}">{r["rule_pct"]}%</td>{score_col(r)}'
+        f'<td>{_bar(r["final_pct"] if judged else r["rule_pct"])}</td></tr>'
         for r in table if r["judgement"])
 
     qrows = []
     for r in rows:
-        ok = "✓" if r["rule_ok"] else "✗"
-        cls = "ok" if r["rule_ok"] else "bad"
+        fok = final_ok(r)
+        ok = "✓" if fok else "✗"
+        cls = "ok" if fok else "bad"
+        rescued = (r["judged"] and not r["rule_ok"] and fok)
+        badge = ' <span class=tag style="color:#3ecf8e">AI rescued</span>' if rescued else ""
         qrows.append(
             f'<details class="{cls}"><summary><b class="{cls}">{ok}</b> '
-            f'<span class=tag>{html.escape(r["kind"])}</span> {html.escape(r["prompt"])}</summary>'
+            f'<span class=tag>{html.escape(r["kind"])}</span> {html.escape(r["prompt"])}{badge}</summary>'
             f'<div class=d><b>Expected</b><p>{html.escape(str(r["expected"]))}</p>'
             f'<b>Answer</b><p>{html.escape(r["answer"] or "(empty)")}</p>'
             f'<b>Rule verdict</b><p>{html.escape(r["rule_reason"])}</p>'
-            + (f'<b>AI judge</b><p>{html.escape(r["judge_reason"])}</p>' if judged else "")
+            + (f'<b>AI judge</b><p>{html.escape(r["judge_reason"] or "(not reviewed — rules passed)")}</p>' if judged else "")
             + f'<b>Sources cited</b><p>{html.escape(", ".join(r["sources"]) or "none")}</p>'
             f'</div></details>')
 
@@ -93,17 +105,18 @@ summary{{cursor:pointer;list-style:none}} b.ok{{color:#3ecf8e}} b.bad{{color:#ff
 <p class=sub>{html.escape(s["company"])} · {html.escape(s["company_id"])} ·
 {s["files"]} documents · asked as {html.escape(s["asker"])} · {html.escape(s["finished_at"])}</p>
 <div class=stats>
-<div class=stat><div class=k>Factual accuracy</div><div class=v style="color:{color(s['factual_rule_pct'])}">{s["factual_rule_pct"]}%</div></div>
+<div class=stat><div class=k>Factual accuracy</div><div class=v style="color:{color(s['factual_final_pct'] if judged else s['factual_rule_pct'])}">{s["factual_final_pct"] if judged else s["factual_rule_pct"]}%</div></div>
 <div class=stat><div class=k>Questions</div><div class=v>{s["total"]}</div></div>
 <div class=stat><div class=k>Leaks</div><div class=v style="color:{'#ff6b6b' if s['leaks'] else '#3ecf8e'}">{s["leaks"]}</div></div>
 <div class=stat><div class=k>Avg latency</div><div class=v>{s["avg_latency"]}s</div></div>
 <div class=stat><div class=k>Duration</div><div class=v>{s["duration"]}s</div></div>
 </div>
 {leak_banner}
+{f'<p class=note>The AI judge double-checked {s["judged_n"]} answer(s) the rules flagged and rescued {s["overturned_n"]} that were correct but worded differently. &ldquo;Reviewed&rdquo; is the score after that check.</p>' if judged else ''}
 <h2>Accuracy by category</h2>
-<table><tr><th>Category</th><th class=n>Asked</th><th>Rules</th>{'<th>AI judge</th>' if judged else ''}<th></th></tr>
+<table><tr><th>Category</th><th class=n>Asked</th><th>Rules</th>{'<th>Reviewed</th>' if judged else ''}<th></th></tr>
 {''.join(trs)}</table>
-{f'<h2>Judgement calls</h2><table><tr><th>Category</th><th class=n>Asked</th><th>Grounded</th>{"<th>AI judge</th>" if judged else ""}<th></th></tr>{jrows}</table><p class=note>Forecasts have no single right answer. &ldquo;Grounded&rdquo; means the projection was anchored to the real historicals and inside a defensible band derived from actual trend. Scored separately so it never moves the factual number.</p>' if jrows else ''}
+{f'<h2>Judgement calls</h2><table><tr><th>Category</th><th class=n>Asked</th><th>Grounded</th>{"<th>Reviewed</th>" if judged else ""}<th></th></tr>{jrows}</table><p class=note>Forecasts have no single right answer. &ldquo;Grounded&rdquo; means the projection was anchored to the real historicals and inside a defensible band derived from actual trend. Scored separately so it never moves the factual number.</p>' if jrows else ''}
 <h2>Every question</h2>
 {''.join(qrows)}
 <p class=note>Generated by naiti {html.escape(str(s.get("seed", "")))} · deterministic seed, reproducible run.</p>

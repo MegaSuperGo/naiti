@@ -118,12 +118,12 @@ def probe(api_key: str, model: str = COMPOSER_MODEL) -> Quota:
         return Quota(ok=True, message=text[:200])   # not a quota problem
 
 
-def estimate_run_tokens(n_questions: int, judge: bool) -> int:
+def estimate_run_tokens(n_questions: int) -> int:
     """Rough cost of a run.
 
     The app sends up to CONTEXT_CHAR_BUDGET (12k chars ≈ 3k tokens) of excerpts
     plus a 2.2k completion allowance, and Groq bills the allowance against the
-    limit — so ~5k tokens a question, plus ~0.6k if the judge is grading.
+    limit — so ~5k tokens a question against the composer model. The judge runs
+    on a different model with a separate quota, so it is not counted here.
     """
-    per = 5_000 + (600 if judge else 0)
-    return n_questions * per
+    return n_questions * 5_000

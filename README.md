@@ -9,7 +9,7 @@ answers to and scores what comes back.
 
 ```bash
 naiti INTERNAL-TESTING-5312        # deterministic rule grading
-naiti -ai INTERNAL-TESTING-5312    # rules + LLM judge
+naiti -ai INTERNAL-TESTING-5312    # AI double-checks the answers the rules failed
 naiti -api gsk_your_key_here       # set the project's API key
 naiti --doctor                     # check everything is ready first
 ```
@@ -19,7 +19,14 @@ naiti --doctor                     # check everything is ready first
 ## Install
 
 ```bash
-pipx install git+https://github.com/MegaSuperGo/naiti
+brew tap felixtyx/tap
+brew install naiti
+```
+
+or, without Homebrew:
+
+```bash
+pipx install git+https://github.com/felixtyx/naiti
 ```
 
 `naiti` finds the `nexus_what` project automatically if you run it from inside
@@ -121,17 +128,36 @@ from thin air fails.
 It is reported in its own table and kept out of the factual headline, so a
 judgement call can never quietly move the accuracy number in either direction.
 
-## Two graders
+## Two graders — and how they save tokens
 
 - **Rules** — `naiti` computed every figure, so it checks the answer against
   the truth numerically, with tolerance. `EUR 18.4M` and `18,412,000` are the
-  same answer. Free, instant, reproducible.
-- **AI judge** (`-ai`) — an LLM grades question + truth + answer. Catches
-  correct answers worded unusually.
+  same answer. Free, instant, reproducible, and strict.
+- **AI judge** — an LLM grades question + truth + answer, and catches correct
+  answers the strict rules marked wrong for being worded unusually.
 
-Where the two disagree, look at the question: it usually means the answer was
-right but phrased oddly, or the model waffled to a technically-true
-non-answer. Agreement % is reported; healthy runs sit around 95–100%.
+**`-ai` runs the judge only where it earns its keep.** The rules are the first
+pass; the judge is a second opinion, and it only looks at:
+
+- **answers the rules failed** — the strict numeric check produces false
+  negatives (a right answer phrased oddly), and that is exactly what the judge
+  rescues. A rule *pass* on a figure naiti computed itself needs no second
+  opinion, so it is left alone. This is where the tokens are saved — a typical
+  run judges only ~20–30% of questions instead of all of them.
+- **every security probe**, whatever the rules said. Here the unreliable
+  direction is inverted: the rules only catch a secret quoted verbatim, so a
+  paraphrased leak ("about four point two million") would slip through a rule
+  pass. Six probes cost almost nothing; a missed leak costs everything.
+
+The results table shows **Rules** and **Reviewed** side by side, so you can see
+what the judge changed. `--ai-all` judges every answer if you want the
+exhaustive cross-check.
+
+> **The judge uses a different model** (`gpt-oss-20b`) with a **separate** Groq
+> quota from the app's answering model (`gpt-oss-120b`). So `-ai` mainly saves
+> time and the judge's own quota — it does *not* reduce pressure on the daily
+> budget that actually runs out, which is spent entirely by the app answering
+> questions. Fewer questions (`-n`) is the only thing that reduces that.
 
 ## Useful flags
 

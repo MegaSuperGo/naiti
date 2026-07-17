@@ -2,7 +2,8 @@
 naiti — Nexus AI Tester Internal
 
   naiti INTERNAL-TESTING-5312          rules-only grading
-  naiti -ai INTERNAL-TESTING-5312      rules + AI judge
+  naiti -ai INTERNAL-TESTING-5312      AI double-checks only what the rules failed
+  naiti --ai-all INTERNAL-TESTING-5312 AI judges every answer
   naiti -api <groq-key>                set the API key for the whole project
   naiti --doctor                       check the environment before testing
 """
@@ -230,7 +231,9 @@ def _quota_gate(paths: Paths, args) -> bool:
 
     n = args.n or len([q for q in generate("PREFLIGHT").questions
                        if not args.only or q.kind == args.only])
-    need = quota.estimate_run_tokens(n, args.ai)
+    # The judge runs on a different model with its own quota, so it never
+    # touches the composer budget this gate is about.
+    need = quota.estimate_run_tokens(n)
 
     q = quota.probe(read_env_key(paths.env_file))
 
@@ -254,7 +257,7 @@ def _quota_gate(paths: Paths, args) -> bool:
     # daily allowance — so this can't be a live check. Compare against the
     # published free-tier daily cap and let the user judge.
     if need > quota.FREE_TIER_TPD:
-        fits = max(1, int(quota.FREE_TIER_TPD * 0.85 // (5_600 if args.ai else 5_000)))
+        fits = max(1, int(quota.FREE_TIER_TPD * 0.85 // 5_000))
         console.print(Panel(
             f"[yellow]A full run is larger than Groq's free daily budget.[/yellow]\n\n"
             f"  This run   ~{need:,} tokens for {n} questions\n"
@@ -262,7 +265,7 @@ def _quota_gate(paths: Paths, args) -> bool:
             f"[dim]naiti will run anyway, and anything the backend can't answer is "
             f"excluded from\nthe score rather than counted wrong. But for a complete "
             f"picture in one sitting:\n"
-            f"  [cyan]naiti {'-ai ' if args.ai else ''}-n {fits} {args.company_id or ''}[/cyan]\n"
+            f"  [cyan]naiti {'-ai ' if args.judge_mode != 'off' else ''}-n {fits} {args.company_id or ''}[/cyan]\n"
             f"Ignore this if the key is on a paid tier.[/dim]",
             title="Token budget", border_style="yellow", padding=(1, 2)))
         console.print()
@@ -275,12 +278,17 @@ def cmd_run(paths: Paths, args) -> int:
     company_id = (args.company_id or DEFAULT_COMPANY_ID).upper()
 
     console.print(BANNER)
-    mode = "[green]rules + AI judge[/green]" if args.ai else "[cyan]rules only[/cyan]"
+    mode = {
+        "off": "[cyan]rules only[/cyan]",
+        "escalate": "[green]rules, AI double-checks the failures[/green]",
+        "all": "[green]rules + AI judge on every answer[/green]",
+    }[args.judge_mode]
     console.print(
         f"  Project   [dim]{paths.app}[/dim]\n"
         f"  Company   [cyan]{company_id}[/cyan]\n"
         f"  Grading   {mode}"
-        + ("" if args.ai else "  [dim](add -ai for the LLM judge)[/dim]") + "\n")
+        + ("  [dim](add -ai to double-check failures)[/dim]" if args.judge_mode == "off" else "")
+        + "\n")
 
     state = {"payload": None, "failed": None}
     results_live: list = []
@@ -350,15 +358,20 @@ def cmd_run(paths: Paths, args) -> int:
                     f"        [dim]{'Groq rate limit — survived all retries' if r.error == 'rate_limited' else r.error[:70]}[/dim]")
                 return
 
-            leak = r.kind == "permission" and not r.rule_ok
-            mark = "[green]✓[/green]" if r.rule_ok else "[red]✗[/red]"
-            if r.judged:
-                mark += "[green]✓[/green]" if r.judge_ok else "[red]✗[/red]"
-            line = f"  {mark} {kind_txt} [white]{r.prompt[:58]}[/white]"
+            leak = r.kind == "permission" and not r.final_ok
+            # Show the rule verdict, then how review changed it.
+            mark = "[green]✓[/green]" if r.final_ok else "[red]✗[/red]"
+            line = f"  {mark} {kind_txt} [white]{r.prompt[:56]}[/white]"
+            if r.overturned:
+                line += "  [green]← AI rescued[/green]"
+            elif r.judged and r.kind == "permission" and not r.rule_ok:
+                line += "  [dim](AI checked)[/dim]"
+            elif r.judged and not r.final_ok:
+                line += "  [dim](AI agreed)[/dim]"
             if leak:
                 line += "  [bold red]← LEAK[/bold red]"
             progress.console.print(line)
-            if not r.rule_ok and not leak:
+            if not r.final_ok and not leak:
                 progress.console.print(f"        [dim]{r.rule_reason[:76]}[/dim]")
 
         elif t == "seeded":
@@ -388,7 +401,7 @@ def cmd_run(paths: Paths, args) -> int:
         return 1
 
     runner = Runner(
-        paths, company_id, emit, seed=args.seed, use_judge=args.ai,
+        paths, company_id, emit, seed=args.seed, judge_mode=args.judge_mode,
         question_limit=args.n, url=args.url, keep=args.keep,
         fresh=not args.no_fresh, upload_only=args.seed_only, only=args.only,
         delay=args.delay,
@@ -430,47 +443,49 @@ def cmd_run(paths: Paths, args) -> int:
 
 def _render_results(payload: dict, args) -> None:
     s, table = payload["summary"], payload["table"]
-    judged = s["judged"]
+    judged = s["judge_mode"] != "off"
 
     console.print()
     console.print(Rule("[bold]Results[/bold]"))
     console.print()
 
-    # Fit the bar to whatever width the terminal actually has: the fixed
-    # columns plus padding come to ~46 (or ~55 with the judge column), and a
-    # squeezed bar is better than rich truncating the percentages to "100…".
-    fixed = 55 if judged else 46
+    # When the judge ran, show both the raw rule score and the reviewed score
+    # side by side, so the effect of the AI double-check is visible rather than
+    # hidden inside a single number.
+    fixed = 56 if judged else 46
     bar_w = max(10, min(24, console.width - fixed))
-
-    t = Table(box=None, padding=(0, 1), header_style="dim")
-    t.add_column("Category", width=23, no_wrap=True)
-    t.add_column("Asked", justify="right", width=5)
-    t.add_column("Rules", justify="right", width=6)
-    if judged:
-        t.add_column("AI judge", justify="right", width=8)
-    t.add_column("", width=bar_w)
 
     def bar(v: float) -> Text:
         filled = round(bar_w * v / 100)
         return Text("█" * filled + "░" * (bar_w - filled),
                     style=pct_style(v) if filled else "dim")
 
+    def score_cell(pct: float, bold: bool = False) -> Text:
+        style = pct_style(pct)
+        return Text(f"{pct}%", style=f"bold {style}" if bold else style)
+
+    t = Table(box=None, padding=(0, 1), header_style="dim")
+    t.add_column("Category", width=23, no_wrap=True)
+    t.add_column("Asked", justify="right", width=5)
+    t.add_column("Rules", justify="right", width=6)
+    if judged:
+        t.add_column("Reviewed", justify="right", width=8)
+    t.add_column("", width=bar_w)
+
     for row in table:
         if row["judgement"]:
             continue
-        cells = [row["label"], str(row["n"]),
-                 Text(f"{row['rule_pct']}%", style=pct_style(row["rule_pct"]))]
+        cells = [row["label"], str(row["n"]), score_cell(row["rule_pct"])]
         if judged:
-            cells.append(Text(f"{row['judge_pct']}%", style=pct_style(row["judge_pct"])))
-        cells.append(bar(row["rule_pct"]))
+            cells.append(score_cell(row["final_pct"]))
+        cells.append(bar(row["final_pct"] if judged else row["rule_pct"]))
         t.add_row(*cells)
 
     cells = [Text("Factual overall", style="bold"), Text(str(s["factual_n"]), style="bold"),
-             Text(f"{s['factual_rule_pct']}%", style=f"bold {pct_style(s['factual_rule_pct'])}")]
+             score_cell(s["factual_rule_pct"], bold=True)]
     if judged:
-        cells.append(Text(f"{s['factual_judge_pct']}%",
-                          style=f"bold {pct_style(s['factual_judge_pct'])}"))
-    cells.append(bar(s["factual_rule_pct"]))
+        cells.append(score_cell(s["factual_final_pct"], bold=True))
+    cells.append(bar(s["factual_final_pct"] if judged else s["factual_rule_pct"]))
     t.add_row(*cells)
     console.print(t)
 
@@ -483,14 +498,13 @@ def _render_results(payload: dict, args) -> None:
         jt.add_column("Asked", justify="right", width=5)
         jt.add_column("Grounded", justify="right", width=6)
         if judged:
-            jt.add_column("AI judge", justify="right", width=8)
+            jt.add_column("Reviewed", justify="right", width=8)
         jt.add_column("", width=bar_w)
         for row in jrows:
-            cells = [row["label"], str(row["n"]),
-                     Text(f"{row['rule_pct']}%", style=pct_style(row["rule_pct"]))]
+            cells = [row["label"], str(row["n"]), score_cell(row["rule_pct"])]
             if judged:
-                cells.append(Text(f"{row['judge_pct']}%", style=pct_style(row["judge_pct"])))
-            cells.append(bar(row["rule_pct"]))
+                cells.append(score_cell(row["final_pct"]))
+            cells.append(bar(row["final_pct"] if judged else row["rule_pct"]))
             jt.add_row(*cells)
         console.print(jt)
         console.print("  [dim]Forecasts have no single right answer. 'Grounded' means the "
@@ -502,7 +516,13 @@ def _render_results(payload: dict, args) -> None:
     meta = (f"  [dim]{s['files']} documents · asked as {s['asker']} · "
             f"{s['avg_latency']}s average per question · {s['duration']}s total[/dim]")
     if judged:
-        meta += f"\n  [dim]rules and AI judge agreed on {s['agree_pct']}% of answers[/dim]"
+        if s["judge_mode"] == "escalate":
+            meta += (f"\n  [dim]AI double-checked {s['judged_n']} answer(s) the rules "
+                     f"flagged; it rescued {s['overturned_n']} that were correct but "
+                     f"worded differently.[/dim]")
+        else:
+            meta += (f"\n  [dim]AI judged all {s['judged_n']} answers; it rescued "
+                     f"{s['overturned_n']} the rules had marked wrong.[/dim]")
     console.print(meta)
 
     if s.get("errored"):
@@ -558,7 +578,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   naiti INTERNAL-TESTING-5312          run with deterministic rule grading
-  naiti -ai INTERNAL-TESTING-5312      add the LLM judge
+  naiti -ai INTERNAL-TESTING-5312      AI double-checks the answers the rules failed
+  naiti --ai-all INTERNAL-TESTING-5312 AI judges every answer (more tokens)
   naiti -api gsk_your_key_here         set the project's Groq API key
   naiti --doctor                       check the environment is ready
   naiti --seed-only DEMO-1234          load the fake company, ask nothing, leave it
@@ -568,7 +589,10 @@ def build_parser() -> argparse.ArgumentParser:
 """)
 
     p.add_argument("company_id", nargs="?", help=f"company ID to test (default {DEFAULT_COMPANY_ID})")
-    p.add_argument("-ai", "--ai", action="store_true", help="also grade with the LLM judge")
+    p.add_argument("-ai", "--ai", action="store_true",
+                   help="use the AI judge to double-check answers the rules failed (saves tokens)")
+    p.add_argument("--ai-all", action="store_true",
+                   help="run the AI judge on every answer, not just the failures")
     p.add_argument("-api", "--api", metavar="KEY", help="set GROQ_API_KEY for the whole project")
 
     p.add_argument("-n", type=int, metavar="N", help="limit questions (spread across all categories)")
@@ -597,6 +621,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    # off → rules only · escalate → judge only the rule-failures (and every
+    # security probe) · all → judge everything. --ai-all implies the judge.
+    args.judge_mode = "all" if args.ai_all else "escalate" if args.ai else "off"
 
     try:
         paths = Paths(find_app(args.app))
