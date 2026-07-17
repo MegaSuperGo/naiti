@@ -22,7 +22,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/MegaSupearGo/naiti"
+Homepage = "https://github.com/MegaSuperGo/naiti"
 
 [project.scripts]
 naiti = "naiti.cli:main"
