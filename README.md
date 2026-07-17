@@ -26,7 +26,7 @@ brew install naiti
 or, without Homebrew:
 
 ```bash
-pipx install git+https://github.com/felixtyx/naiti
+  pipx install git+https://github.com/MegaSuperGo/naiti
 ```
 
 `naiti` finds the `nexus_what` project automatically if you run it from inside
