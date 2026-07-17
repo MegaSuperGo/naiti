@@ -19,13 +19,6 @@ naiti --doctor                     # check everything is ready first
 ## Install
 
 ```bash
-brew tap felixtyx/tap
-brew install naiti
-```
-
-or, without Homebrew:
-
-```bash
 pipx install git+https://github.com/felixtyx/naiti
 ```
 
